@@ -4,10 +4,8 @@ import re
 from collections.abc import Iterable, Mapping
 
 
-# Deliberately broad: unknown headings remain part of the text and are handled
-# by paragraph/size based splitting rather than being discarded.
-
-# I need to make changes to _Heading_ALIASES to include more headings or change the ones that were generated.
+# Known heading spellings are mapped to stable section labels. Other likely
+# standalone headings keep their own cleaned title as the section label.
 _HEADING_ALIASES = {
     "attendance": "Attendance",
     "attendance policy": "Attendance",
@@ -44,15 +42,76 @@ _HEADING_ALIASES = {
     "textbooks": "Textbooks",
     "textbook": "Textbooks",
     "course content": "Course Content",
+    "criteria for grading": "Grading",
+    "grades and grading": "Grading",
+    "final examination": "Exams",
+    "final exam": "Exams",
+    "missed exam policy": "Exams",
+    "exam policy": "Exams",
+    "collaboration and academic integrity": "Academic Integrity",
+    "instructor office hours": "Office Hours",
+    "ta office hours": "Office Hours",
+    "required textbook": "Textbooks",
+    "required textbooks": "Textbooks",
+    "suggested textbook": "Textbooks",
+    "suggested textbooks": "Textbooks",
+    "course assignments": "Assignments",
+    "written assignments": "Assignments",
+    "assignment revision policy": "Assignments",
+    "topical outline": "Course Content",
+    "sessions": "Course Schedule",
+    "learning outcomes": "Course Content",
+    "course resources": "Course Resources",
+    "evaluations": "Grading",
+    "problem sets": "Assignments",
+    "plagiarism": "Academic Integrity",
+}
+
+_HEADING_CUES = {
+    "academic", "assignment", "attendance", "course", "discussion", "exam",
+    "grade", "grading", "hours", "information", "integrity", "office", "outcome",
+    "policy", "prerequisite", "resource", "responsibility", "schedule", "session",
+    "textbook", "topic",
 }
 
 
-def _heading(line: str) -> str | None:
+def _clean_heading(line: str) -> str:
     cleaned = line.strip()
-    cleaned = re.sub(r"^[#*\s]+|[*_\s]+$", "", cleaned)
-    cleaned = re.sub(r"\s*:\s*$", "", cleaned)
-    normalized = re.sub(r"\s+", " ", cleaned).lower()
-    return _HEADING_ALIASES.get(normalized)
+    cleaned = re.sub(r"^[#*\s]+|[#*_\s]+$", "", cleaned)
+    cleaned = re.sub(r"[\s:.,;]+$", "", cleaned)
+    return re.sub(r"\s+", " ", cleaned)
+
+
+def _heading(line: str) -> str | None:
+    """Return a canonical label for a recognized heading spelling."""
+    cleaned = _clean_heading(line)
+    return _HEADING_ALIASES.get(cleaned.lower())
+
+
+def _likely_unlisted_heading(line: str) -> str | None:
+    """Conservatively recognize short, standalone title-like heading lines."""
+    cleaned = _clean_heading(line)
+    words = cleaned.split()
+    if not cleaned or len(cleaned) > 60 or len(words) > 8 or any(ch.isdigit() for ch in cleaned):
+        return None
+    if cleaned.startswith(("•", "-", "o ")) or re.match(r"^\d+[.)]", cleaned):
+        return None
+    # A colon followed by same-line content is not a standalone heading; keep
+    # the full line and let the recognized inline-heading path handle it.
+    if ":" in cleaned and not line.strip().endswith(":"):
+        return None
+    # Require heading-like capitalization even when a line ends in a colon;
+    # prose fragments such as "in this order:" should not become section names.
+    if cleaned.isupper() and any(char.isalpha() for char in cleaned):
+        return cleaned.title()
+    title_case = len(words) >= 2 and all(word[:1].isupper() for word in words)
+    has_heading_cue = any(
+        any(cue in re.sub(r"[^a-z]", "", word.lower()) for cue in _HEADING_CUES)
+        for word in words
+    )
+    if title_case and has_heading_cue and not cleaned.endswith((".", "?", "!")):
+        return cleaned
+    return None
 
 
 def _split_long(text: str, size: int, overlap: int) -> list[str]:
@@ -85,8 +144,9 @@ def chunk_text(pages: Iterable[Mapping], chunk_size: int = 1000,
         overlap: Character overlap for splitting a long paragraph.
 
     Returns dictionaries with ``chunk_id``, ``text``, ``section``, and
-    ``pages`` (unique source page numbers). Section headings are recognized
-    from a small syllabus vocabulary; other text is chunked by paragraphs.
+    ``pages`` (unique source page numbers). Known headings receive canonical
+    labels; likely standalone unlisted headings start sections with their own
+    title as the label. Remaining text is chunked by paragraphs and size.
     """
     if chunk_size <= 0:
         raise ValueError("chunk_size must be greater than zero")
@@ -114,6 +174,10 @@ def chunk_text(pages: Iterable[Mapping], chunk_size: int = 1000,
                 match = _heading(stripped)
                 if match:
                     current_section = match
+                    continue
+                unlisted_heading = _likely_unlisted_heading(stripped)
+                if unlisted_heading:
+                    current_section = unlisted_heading
                     continue
                 inline = re.match(r"^([^:]{2,60}):\s+(.+)$", stripped)
                 inline_heading = _heading(inline.group(1)) if inline else None
